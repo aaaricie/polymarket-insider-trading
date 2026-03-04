@@ -10,9 +10,9 @@ Prerequisites:
     pip install requests atproto websockets
 
 Environment variables:
-    BSKY_HANDLE          – Bluesky handle (e.g. user.bsky.social)
-    BSKY_PASSWORD        – Bluesky app password
-    POLYGONSCAN_API_KEY  – (optional) for account creation-date lookups
+    BSKY_HANDLE       – Bluesky handle (e.g. user.bsky.social)
+    BSKY_PASSWORD     – Bluesky app password
+    ETHERSCAN_API_KEY – (optional) Etherscan V2 key for wallet creation dates
 
 Changes from v5.2:
     • websockets v14+ compatibility (_ws_is_open helper).
@@ -20,6 +20,7 @@ Changes from v5.2:
     • Stats keyed per asset_id (per-outcome) for accurate z-scores.
     • Stats cleanup aligned to asset_id keys (no more memory leak).
     • Dynamically spawned WS tasks are tracked for clean shutdown.
+    • Migrated from deprecated PolygonScan V1 to Etherscan API V2.
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ CONFIG = {
     "GAMMA_API":       "https://gamma-api.polymarket.com",
     "DATA_API":        "https://data-api.polymarket.com",
     "WS_URL":          "wss://ws-subscriptions-clob.polymarket.com/ws/market",
-    "POLYGONSCAN_API": "https://api.polygonscan.com/api",
+    "ETHERSCAN_API":   "https://api.etherscan.io/v2/api",
 
     # ── WebSocket ───────────────────────────────────────────
     "MAX_TOKENS_PER_CONNECTION": 250,
@@ -76,8 +77,8 @@ CONFIG = {
     "BSKY_PASSWORD": os.getenv("BSKY_PASSWORD", ""),
     "POST_TO_BLUESKY": True,
 
-    # ── Polygonscan (optional) ──────────────────────────────
-    "POLYGONSCAN_API_KEY": os.getenv("POLYGONSCAN_API_KEY", ""),
+    # ── Etherscan V2 (optional, for wallet creation dates) ──
+    "ETHERSCAN_API_KEY": os.getenv("ETHERSCAN_API_KEY", ""),
 
     # ── Internal ────────────────────────────────────────────
     "SEEN_CACHE_SIZE":      10_000,
@@ -329,7 +330,7 @@ class MarketFetcher:
 
 
 # ────────────────────────────────────────────────────────────
-# TRADE ENRICHER  (Data API + Polygonscan)
+# TRADE ENRICHER  (Data API + Etherscan V2)
 # ────────────────────────────────────────────────────────────
 
 class TradeEnricher:
@@ -418,17 +419,23 @@ class TradeEnricher:
         for action in ("txlist", "txlistinternal"):
             try:
                 params: dict = {
-                    "module": "account", "action": action,
-                    "address": wallet,
-                    "startblock": 0, "endblock": 99999999,
-                    "page": 1, "offset": 1, "sort": "asc",
+                    "chainid":    137,
+                    "module":     "account",
+                    "action":     action,
+                    "address":    wallet,
+                    "startblock": 0,
+                    "endblock":   99999999,
+                    "page":       1,
+                    "offset":     1,
+                    "sort":       "asc",
                 }
-                key = CONFIG.get("POLYGONSCAN_API_KEY", "")
+                key = CONFIG.get("ETHERSCAN_API_KEY", "")
                 if key:
                     params["apikey"] = key
 
                 r = self._session.get(
-                    CONFIG["POLYGONSCAN_API"], params=params,
+                    CONFIG["ETHERSCAN_API"],
+                    params=params,
                     timeout=CONFIG["ENRICHMENT_TIMEOUT"],
                 )
                 r.raise_for_status()
@@ -525,16 +532,16 @@ class WebSocketMonitor:
         self.enricher = TradeEnricher()
         self.poster   = BlueskyPoster()
         self.stats:    dict[str, MarketStats] = defaultdict(MarketStats)
-        self.seen:     dict[str, None] = {}                                # FIX 1: O(1) dict
+        self.seen:     dict[str, None] = {}
 
-        self.current_tokens: set[str]                                        = set()
-        self._conn_tokens:   dict[int, set[str]]                            = {}
-        self._active_ws:     dict[int, object]                              = {}
-        self._ws_lock                                                        = asyncio.Lock()
-        self._alert_q:       asyncio.Queue[TradeAlert]                      = asyncio.Queue(
+        self.current_tokens: set[str]            = set()
+        self._conn_tokens:   dict[int, set[str]] = {}
+        self._active_ws:     dict[int, object]   = {}
+        self._ws_lock                            = asyncio.Lock()
+        self._alert_q: asyncio.Queue[TradeAlert] = asyncio.Queue(
             maxsize=CONFIG["ALERT_QUEUE_SIZE"]
         )
-        self._tasks:         list[asyncio.Task] = []                        # FIX 3: track tasks
+        self._tasks: list[asyncio.Task] = []
 
         self._backfill_session = requests.Session()
         self._backfill_session.headers["User-Agent"] = "polymarket-monitor/5.3"
@@ -542,13 +549,7 @@ class WebSocketMonitor:
     # ─────────── websockets version compatibility ────────────────────
 
     @staticmethod
-    def _ws_is_open(ws) -> bool:                                            # FIX 0: v14 compat
-        """Return True if the WebSocket connection is still open.
-
-        Compatible with both the legacy WebSocketClientProtocol
-        (.closed attribute) and the newer ClientConnection
-        (.close_code attribute) introduced in websockets v14.
-        """
+    def _ws_is_open(ws) -> bool:
         if hasattr(ws, "closed"):
             return not ws.closed
         if hasattr(ws, "close_code"):
@@ -570,19 +571,17 @@ class WebSocketMonitor:
 
             uid = f"{ts_ms}-{aid}-{sz}-{px}-{side}"
 
-            # ── FIX 1: O(1) dedup via dict ──
             if uid in self.seen:
                 return
             self.seen[uid] = None
             if len(self.seen) > CONFIG["SEEN_CACHE_SIZE"]:
                 self.seen.pop(next(iter(self.seen)))
-            # ── END FIX 1 ──
 
             if usd <= 0:
                 return
 
             meta = self.fetcher.get_metadata(aid)
-            key  = aid                                                      # FIX 4: per-outcome
+            key  = aid
             st   = self.stats[key]
             dt   = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
             rec  = TradeRecord(size_usd=usd, timestamp=dt, is_buy=(side == "BUY"))
@@ -807,11 +806,9 @@ class WebSocketMonitor:
                 added   = new_all - self.current_tokens
                 removed = self.current_tokens - new_all
 
-                # ── REMOVE closed markets ──
                 if removed:
                     log.info("Removing %d tokens from closed markets", len(removed))
 
-                    # FIX 2: clean up stats by asset_id (aligned with FIX 4)
                     for tid in removed:
                         self.stats.pop(tid, None)
                         self.fetcher.token_metadata.pop(tid, None)
@@ -838,10 +835,9 @@ class WebSocketMonitor:
                     for idx in conns_to_reconnect:
                         async with self._ws_lock:
                             ws = self._active_ws.get(idx)
-                            if ws and self._ws_is_open(ws):                 # FIX 0
+                            if ws and self._ws_is_open(ws):
                                 log.info(
-                                    "WS-%d: closing to apply removals",
-                                    idx,
+                                    "WS-%d: closing to apply removals", idx,
                                 )
                                 await ws.close()
 
@@ -849,13 +845,11 @@ class WebSocketMonitor:
                             self._conn_tokens.pop(idx, None)
                             log.info("WS-%d: slot freed (all tokens closed)", idx)
 
-                # ── ADD new markets ──
                 if added:
                     added_list = list(added)
                     log.info("Subscribing to %d new tokens", len(added_list))
 
-                    cap = CONFIG["MAX_TOKENS_PER_CONNECTION"]
-
+                    cap       = CONFIG["MAX_TOKENS_PER_CONNECTION"]
                     remaining = list(added_list)
 
                     while remaining:
@@ -876,7 +870,7 @@ class WebSocketMonitor:
                             self._conn_tokens[target].update(batch)
                             async with self._ws_lock:
                                 ws = self._active_ws.get(target)
-                                if ws and self._ws_is_open(ws):             # FIX 0
+                                if ws and self._ws_is_open(ws):
                                     try:
                                         await ws.send(json.dumps({
                                             "assets_ids": batch,
@@ -897,7 +891,6 @@ class WebSocketMonitor:
                         elif len(self._active_ws) < CONFIG["MAX_WS_CONNECTIONS"]:
                             batch = remaining[:cap]
                             self._conn_tokens[next_id] = set(batch)
-                            # FIX 3: track dynamically spawned tasks
                             task = asyncio.create_task(
                                 self._ws_loop(next_id, batch)
                             )
@@ -918,7 +911,6 @@ class WebSocketMonitor:
                             )
                             break
 
-                # ── Summary ──
                 active_conns  = len(self._conn_tokens)
                 active_tokens = sum(len(t) for t in self._conn_tokens.values())
                 log.info(
@@ -973,7 +965,6 @@ class WebSocketMonitor:
             len(batches), len(all_tokens), CONFIG["WS_CONNECT_STAGGER_DELAY"],
         )
 
-        # FIX 3: use self._tasks so dynamic spawns are included
         self._tasks = [asyncio.create_task(self._ws_loop(i, b))
                        for i, b in enumerate(batches)]
         self._tasks.append(asyncio.create_task(self._refresh_loop()))
